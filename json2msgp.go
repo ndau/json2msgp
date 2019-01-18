@@ -6,21 +6,28 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
+	"sort"
 	"unicode/utf8"
 
+	"github.com/oneiro-ndev/ndaumath/pkg/address"
 	"github.com/pkg/errors"
 	"github.com/tinylib/msgp/msgp"
 )
 
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
+// - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
 func stringHeuristic(s string, buffer []byte) []byte {
 	if !utf8.ValidString(s) {
 		return msgp.AppendBytes(buffer, []byte(s))
 	}
+	_, err := address.Validate(s)
+	if err == nil {
+		return msgp.AppendString(buffer, s)
+	}
 	b64bytes, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
+	if err == nil {
 		return msgp.AppendBytes(buffer, b64bytes)
 	}
 	return msgp.AppendString(buffer, s)
@@ -29,7 +36,18 @@ func stringHeuristic(s string, buffer []byte) []byte {
 func convertMapStrStr(m map[string]string, b []byte) []byte {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
-	for key, val := range m {
+
+	// sort keys for deterministic output
+	// not critical for actual behavior, but we can't really test properly
+	// without this
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	for _, key := range keys {
+		val := m[key]
 		b = msgp.AppendString(b, key)
 		b = stringHeuristic(val, b)
 	}
@@ -39,8 +57,19 @@ func convertMapStrStr(m map[string]string, b []byte) []byte {
 func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
+
+	// sort keys for deterministic output
+	// not critical for actual behavior, but we can't really test properly
+	// without this
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
 	var err error
-	for key, val := range m {
+	for _, key := range keys {
+		val := m[key]
 		b = msgp.AppendString(b, key)
 		b, err = convert(val, b)
 		if err != nil {
@@ -52,6 +81,8 @@ func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 
 func convert(in interface{}, buffer []byte) ([]byte, error) {
 	switch x := in.(type) {
+	case string:
+		return stringHeuristic(x, buffer), nil
 	case map[string]interface{}:
 		return convertMapStrIntf(x, buffer)
 	case map[string]string:
@@ -71,10 +102,8 @@ func convert(in interface{}, buffer []byte) ([]byte, error) {
 	var err error
 	v := reflect.ValueOf(in)
 	switch v.Kind() {
-	case reflect.String:
-		return stringHeuristic(in.(string), buffer), nil
 	case reflect.Ptr:
-		return convert(v.Elem(), buffer)
+		return convert(v.Elem().Interface(), buffer)
 	case reflect.Array, reflect.Slice:
 		l := v.Len()
 		buffer = msgp.AppendArrayHeader(buffer, uint32(l))
@@ -95,6 +124,7 @@ func convert(in interface{}, buffer []byte) ([]byte, error) {
 // Strings are converted using the following heuristic:
 //
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
+// - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
 //
@@ -111,6 +141,7 @@ func Convert(in interface{}) ([]byte, error) {
 // Strings are converted using the following heuristic:
 //
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
+// - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
 func ConvertStream(in io.Reader, out io.Writer) error {
@@ -124,7 +155,7 @@ func ConvertStream(in io.Reader, out io.Writer) error {
 	}
 
 	var jsobj interface{}
-	err = json.Unmarshal(buffer.Bytes(), jsobj)
+	err = json.Unmarshal(buffer.Bytes(), &jsobj)
 	if err != nil {
 		return errors.Wrap(err, "ConvertStream unmarshalling JSON")
 	}
