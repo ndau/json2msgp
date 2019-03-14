@@ -52,9 +52,9 @@ func TestConvert(t *testing.T) {
 // more complicated tests go here because it's easier to do complicated
 // nesting structures in json than raw go
 func TestConvertStream(t *testing.T) {
-	// The bytes are generated for these sample system variables were gotten using the actual
-	// encoded bytes used on the blockchain.  This way, the tests assert that when we convert
-	// from json to msgp, it'll match for these system variables.  For example:
+	// The bytes we use for these sample system variables were gotten using the actual encoded
+	// bytes used on the blockchain.  This way, the tests assert that when we convert from json
+	// to msgp, it'll match the proper msgp format for these system variables.  For example:
 	// To get the input string:
 	//   ./chaos get sysvar EAIFeeTable -m | jq . -S -c
 	// To get the output bytes:
