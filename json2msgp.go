@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"reflect"
 	"sort"
@@ -14,11 +15,17 @@ import (
 	"github.com/tinylib/msgp/msgp"
 )
 
+// Converter manages state during the converstion process.
+type Converter struct {
+	currentKey string            // The key we're currently processing.
+	typeHints  map[string]string // Use this map with the current key to find its expected type.
+}
+
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
 // - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
-func stringHeuristic(s string, buffer []byte) []byte {
+func (c *Converter) stringHeuristic(s string, buffer []byte) []byte {
 	if !utf8.ValidString(s) {
 		return msgp.AppendBytes(buffer, []byte(s))
 	}
@@ -33,7 +40,7 @@ func stringHeuristic(s string, buffer []byte) []byte {
 	return msgp.AppendString(buffer, s)
 }
 
-func convertMapStrStr(m map[string]string, b []byte) []byte {
+func (c *Converter) convertMapStrStr(m map[string]string, b []byte) []byte {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
 
@@ -49,12 +56,13 @@ func convertMapStrStr(m map[string]string, b []byte) []byte {
 	for _, key := range keys {
 		val := m[key]
 		b = msgp.AppendString(b, key)
-		b = stringHeuristic(val, b)
+		c.currentKey = key
+		b = c.stringHeuristic(val, b)
 	}
 	return b
 }
 
-func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
+func (c *Converter) convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
 
@@ -71,7 +79,8 @@ func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	for _, key := range keys {
 		val := m[key]
 		b = msgp.AppendString(b, key)
-		b, err = convert(val, b)
+		c.currentKey = key
+		b, err = c.convert(val, b)
 		if err != nil {
 			return b, err
 		}
@@ -79,36 +88,68 @@ func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	return b, nil
 }
 
-func convert(in interface{}, buffer []byte) ([]byte, error) {
+func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 	switch x := in.(type) {
 	case string:
-		return stringHeuristic(x, buffer), nil
+		return c.stringHeuristic(x, buffer), nil
 	case map[string]interface{}:
-		return convertMapStrIntf(x, buffer)
+		return c.convertMapStrIntf(x, buffer)
 	case map[string]string:
-		return convertMapStrStr(x, buffer), nil
+		return c.convertMapStrStr(x, buffer), nil
 	case []interface{}:
 		buffer = msgp.AppendArrayHeader(buffer, uint32(len(x)))
 		var err error
 		for _, v := range x {
-			buffer, err = convert(v, buffer)
+			buffer, err = c.convert(v, buffer)
 			if err != nil {
 				return buffer, err
 			}
 		}
 		return buffer, nil
+	case float64:
+		// The json input treats all numeric values as float64.  Without knowing the original
+		// data type, we don't know how to encode numeric values.  First, see if there's a hint.
+		if c.typeHints != nil {
+			if typeHint, ok := c.typeHints[c.currentKey]; ok {
+				switch typeHint {
+				case "int64":
+					return msgp.AppendInt64(buffer, int64(x)), nil
+				case "uint64":
+					return msgp.AppendUint64(buffer, uint64(x)), nil
+				default:
+					return buffer, fmt.Errorf(
+						"Unsupported type hint %s=%s", c.currentKey, typeHint)
+				}
+			}
+		}
+
+		// Most of what we encode are of type uint64, so we make that assumption here as part of
+		// this heuristic if we didn't find a type hint for it.
+		if x >= 0.0 {
+			i := uint64(x)
+			if float64(i) == x {
+				return msgp.AppendUint64(buffer, i), nil
+			}
+		}
+
+		// We error here, rather than encoding in a different format.  Otherwise we could wind up
+		// encoding a blob of json containing multiple occurrences of a given variable (e.g. an
+		// array of objects), some of which get encoded one way, the rest another way.  In that
+		// case, when msgp unmarshals it later, it won't be able to handle the two different ways
+		// we encode the numeric values.  So, it's better to make this clear at encode-time.
+		return buffer, fmt.Errorf("Unsupported numeric value %v", x)
 	}
 
 	var err error
 	v := reflect.ValueOf(in)
 	switch v.Kind() {
 	case reflect.Ptr:
-		return convert(v.Elem().Interface(), buffer)
+		return c.convert(v.Elem().Interface(), buffer)
 	case reflect.Array, reflect.Slice:
 		l := v.Len()
 		buffer = msgp.AppendArrayHeader(buffer, uint32(l))
 		for i := 0; i < l; i++ {
-			buffer, err = convert(v.Index(i).Interface(), buffer)
+			buffer, err = c.convert(v.Index(i).Interface(), buffer)
 			if err != nil {
 				return buffer, err
 			}
@@ -131,9 +172,10 @@ func convert(in interface{}, buffer []byte) ([]byte, error) {
 // This is primarily intended to assist conversion from JSON to MSGP, so certain
 // conversions such as structs are intentionally excluded. If you have a struct,
 // use `msgp.Marshal` directly.
-func Convert(in interface{}) ([]byte, error) {
+func Convert(in interface{}, typeHints map[string]string) ([]byte, error) {
 	buffer := make([]byte, 0)
-	return convert(in, buffer)
+	c := Converter{typeHints: typeHints}
+	return c.convert(in, buffer)
 }
 
 // ConvertStream reads JSON from `in` and copies it as MSGP to `out` until EOF.
@@ -144,7 +186,11 @@ func Convert(in interface{}) ([]byte, error) {
 // - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
-func ConvertStream(in io.Reader, out io.Writer) error {
+//
+// Numeric valuse need extra help to know their types.  Use the typeHints map for that.  For
+// example, if all "Fee" variables are to be encoded as int64, and "ChangeOn" as uint64, use:
+// typeHints = {"Fee": "int64", "ChangeOn": "uint64"}
+func ConvertStream(in io.Reader, out io.Writer, typeHints map[string]string) error {
 	// JSON isn't length-prefixed, so we kind of have to parse the whole thing.
 	// It's a nice convenience function, at least, and we all have Effectively
 	// Infinite Memory, right?
@@ -160,7 +206,7 @@ func ConvertStream(in io.Reader, out io.Writer) error {
 		return errors.Wrap(err, "ConvertStream unmarshalling JSON")
 	}
 
-	msgp, err := Convert(jsobj)
+	msgp, err := Convert(jsobj, typeHints)
 	if err != nil {
 		return err
 	}
