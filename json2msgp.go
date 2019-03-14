@@ -17,8 +17,15 @@ import (
 
 // Converter manages state during the converstion process.
 type Converter struct {
-	currentKey string            // The key we're currently processing.
-	typeHints  map[string]string // Use this map with the current key to find its expected type.
+	// The key we're currently processing.
+	currentKey string              
+
+	// Use this map with the current key to find its expected type.
+	typeHints map[string][]string
+
+	// When there are multiple types per hint name, it is used with arrays of values in json.
+	// This is an index into the []string of typeHints[currentKey].
+	currentHint int
 }
 
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
@@ -99,11 +106,14 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 	case []interface{}:
 		buffer = msgp.AppendArrayHeader(buffer, uint32(len(x)))
 		var err error
+		// Because we reset this every time, this only works on the innermost of nested arrays.
+		c.currentHint = 0
 		for _, v := range x {
 			buffer, err = c.convert(v, buffer)
 			if err != nil {
 				return buffer, err
 			}
+			c.currentHint++
 		}
 		return buffer, nil
 	case float64:
@@ -111,25 +121,24 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 		// data type, we don't know how to encode numeric values.  First, see if there's a hint.
 		if c.typeHints != nil {
 			if typeHint, ok := c.typeHints[c.currentKey]; ok {
-				switch typeHint {
+				currentHint := typeHint[c.currentHint % len(typeHint)]
+				switch currentHint {
 				case "int64":
 					return msgp.AppendInt64(buffer, int64(x)), nil
 				case "uint64":
 					return msgp.AppendUint64(buffer, uint64(x)), nil
 				default:
 					return buffer, fmt.Errorf(
-						"Unsupported type hint %s=%s", c.currentKey, typeHint)
+						"Unsupported type hint %s=%s", c.currentKey, currentHint)
 				}
 			}
 		}
 
-		// Most of what we encode are of type uint64, so we make that assumption here as part of
+		// Most of what we encode are of type int64, so we make that assumption here as part of
 		// this heuristic if we didn't find a type hint for it.
-		if x >= 0.0 {
-			i := uint64(x)
-			if float64(i) == x {
-				return msgp.AppendUint64(buffer, i), nil
-			}
+		i := int64(x)
+		if float64(i) == x {
+			return msgp.AppendInt64(buffer, i), nil
 		}
 
 		// We error here, rather than encoding in a different format.  Otherwise we could wind up
@@ -172,7 +181,7 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 // This is primarily intended to assist conversion from JSON to MSGP, so certain
 // conversions such as structs are intentionally excluded. If you have a struct,
 // use `msgp.Marshal` directly.
-func Convert(in interface{}, typeHints map[string]string) ([]byte, error) {
+func Convert(in interface{}, typeHints map[string][]string) ([]byte, error) {
 	buffer := make([]byte, 0)
 	c := Converter{typeHints: typeHints}
 	return c.convert(in, buffer)
@@ -187,10 +196,14 @@ func Convert(in interface{}, typeHints map[string]string) ([]byte, error) {
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
 //
-// Numeric valuse need extra help to know their types.  Use the typeHints map for that.  For
-// example, if all "Fee" variables are to be encoded as int64, and "ChangeOn" as uint64, use:
-// typeHints = {"Fee": "int64", "ChangeOn": "uint64"}
-func ConvertStream(in io.Reader, out io.Writer, typeHints map[string]string) error {
+// Numeric valuse need extra help to know their types.  Use the typeHints map for that.
+//
+// - if all "Fee" variables are to be encoded as int64, and "ChangeOn" as uint64, then use:
+//   typeHints = {"Fee": []string{"int64"}, "ChangeOn": []string{"uint64"}}
+// - if there are blobs of json without names, yet there are arrays of differing numeric types,
+//   such as: [[0,1],[-2,3],[4,5]], then use:
+//   typeHints = {"": []string{"int64", "uint64"}}
+func ConvertStream(in io.Reader, out io.Writer, typeHints map[string][]string) error {
 	// JSON isn't length-prefixed, so we kind of have to parse the whole thing.
 	// It's a nice convenience function, at least, and we all have Effectively
 	// Infinite Memory, right?
