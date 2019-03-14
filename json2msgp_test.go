@@ -66,15 +66,13 @@ func TestConvertStream(t *testing.T) {
 		wantOut string
 		wantErr bool
 	}{
-/* TODO
 		{
 			"AccountAttributes",
-			``,
+			`{"ndaegwggj8qv7tqccvz6ffrthkbnmencp9t2y4mn89gdq3yk":{"x":{}}}`,
 			nil,
-			"",
+			"81 d9 30 6e 64 61 65 67 77 67 67 6a 38 71 76 37 74 71 63 63 76 7a 36 66 66 72 74 68 6b 62 6e 6d 65 6e 63 70 39 74 32 79 34 6d 6e 38 39 67 64 71 33 79 6b 81 a1 78 80",
 			false,
 		},
-*/
 		{
 			"CommandValidatorChangeAddress",
 			`["ndnf9ffbzhyf8mk7z5vvqc4quzz5i2exp5zgsmhyhc9cuwr4"]`,
