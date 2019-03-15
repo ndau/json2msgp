@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"reflect"
 	"sort"
@@ -14,11 +15,24 @@ import (
 	"github.com/tinylib/msgp/msgp"
 )
 
+// Converter manages state during the converstion process.
+type Converter struct {
+	// The key we're currently processing.
+	currentKey string              
+
+	// Use this map with the current key to find its expected type.
+	typeHints map[string][]string
+
+	// When there are multiple types per hint name, it is used with arrays of values in json.
+	// This is an index into the []string of typeHints[currentKey].
+	currentHint int
+}
+
 // - if the string is not valid utf-8, it is passed through as a byte array without modification.
 // - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
-func stringHeuristic(s string, buffer []byte) []byte {
+func (c *Converter) stringHeuristic(s string, buffer []byte) []byte {
 	if !utf8.ValidString(s) {
 		return msgp.AppendBytes(buffer, []byte(s))
 	}
@@ -33,7 +47,7 @@ func stringHeuristic(s string, buffer []byte) []byte {
 	return msgp.AppendString(buffer, s)
 }
 
-func convertMapStrStr(m map[string]string, b []byte) []byte {
+func (c *Converter) convertMapStrStr(m map[string]string, b []byte) []byte {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
 
@@ -49,12 +63,13 @@ func convertMapStrStr(m map[string]string, b []byte) []byte {
 	for _, key := range keys {
 		val := m[key]
 		b = msgp.AppendString(b, key)
-		b = stringHeuristic(val, b)
+		c.currentKey = key
+		b = c.stringHeuristic(val, b)
 	}
 	return b
 }
 
-func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
+func (c *Converter) convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	sz := uint32(len(m))
 	b = msgp.AppendMapHeader(b, sz)
 
@@ -71,7 +86,8 @@ func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	for _, key := range keys {
 		val := m[key]
 		b = msgp.AppendString(b, key)
-		b, err = convert(val, b)
+		c.currentKey = key
+		b, err = c.convert(val, b)
 		if err != nil {
 			return b, err
 		}
@@ -79,36 +95,101 @@ func convertMapStrIntf(m map[string]interface{}, b []byte) ([]byte, error) {
 	return b, nil
 }
 
-func convert(in interface{}, buffer []byte) ([]byte, error) {
+func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 	switch x := in.(type) {
 	case string:
-		return stringHeuristic(x, buffer), nil
+		return c.stringHeuristic(x, buffer), nil
 	case map[string]interface{}:
-		return convertMapStrIntf(x, buffer)
+		return c.convertMapStrIntf(x, buffer)
 	case map[string]string:
-		return convertMapStrStr(x, buffer), nil
+		return c.convertMapStrStr(x, buffer), nil
 	case []interface{}:
 		buffer = msgp.AppendArrayHeader(buffer, uint32(len(x)))
 		var err error
+		// Because we reset this every time, this only works on the innermost of nested arrays.
+		// TODO: Generalize the type hint spec.  The way this is done now, with the % operator
+		// to grab currentHint below, is just a minimal solution to account for arrays with
+		// unnamed values.  We might consider generalized nested arrays, and also allowing a
+		// single-type hint without having to be inside an array within the hint json.
+		c.currentHint = 0
 		for _, v := range x {
-			buffer, err = convert(v, buffer)
+			buffer, err = c.convert(v, buffer)
 			if err != nil {
 				return buffer, err
 			}
+			c.currentHint++
 		}
 		return buffer, nil
+	case float64:
+		// The json input treats all numeric values as float64.  Without knowing the original
+		// data type, we don't know how to encode numeric values.  First, see if there's a hint.
+		if c.typeHints != nil {
+			if typeHint, ok := c.typeHints[c.currentKey]; ok {
+				currentHint := typeHint[c.currentHint % len(typeHint)]
+				// Support type hints for all msgp numeric formats.  We don't ensure that the
+				// value fits into the hinted type.  If there is a casting problem, the tool's
+				// user will have to supply a different type hint, or alter the input json.
+				switch currentHint {
+				case "byte":
+					return msgp.AppendByte(buffer, byte(x)), nil
+				case "float32":
+					return msgp.AppendFloat32(buffer, float32(x)), nil
+				case "float64":
+					return msgp.AppendFloat64(buffer, x), nil
+				case "int":
+					return msgp.AppendInt(buffer, int(x)), nil
+				case "int8":
+					return msgp.AppendInt8(buffer, int8(x)), nil
+				case "int16":
+					return msgp.AppendInt16(buffer, int16(x)), nil
+				case "int32":
+					return msgp.AppendInt32(buffer, int32(x)), nil
+				case "int64":
+					return msgp.AppendInt64(buffer, int64(x)), nil
+				case "uint":
+					return msgp.AppendUint(buffer, uint(x)), nil
+				case "uint8":
+					return msgp.AppendUint8(buffer, uint8(x)), nil
+				case "uint16":
+					return msgp.AppendUint16(buffer, uint16(x)), nil
+				case "uint32":
+					return msgp.AppendUint32(buffer, uint32(x)), nil
+				case "uint64":
+					return msgp.AppendUint64(buffer, uint64(x)), nil
+				default:
+					return buffer, fmt.Errorf(
+						"Unsupported numeric type hint %s=%s", c.currentKey, currentHint)
+				}
+			}
+		}
+
+		// Most of what we encode are of type int64, so we make that assumption here as part of
+		// this heuristic if we didn't find a type hint for it.
+		i := int64(x)
+		// Make sure the value is indeed an integer (has no fractional part).  This is meant as
+		// a convenience check for the tool's user.  We'll error below if this check fails.
+		if float64(i) == x {
+			return msgp.AppendInt64(buffer, i), nil
+		}
+
+		// We error here, rather than encoding to general float64.  Otherwise we could wind up
+		// encoding a blob of json containing multiple occurrences of a given variable (e.g. an
+		// array of objects), some of which get encoded one way, the rest another way.  In that
+		// case, when msgp unmarshals it later, it won't be able to handle the two different ways
+		// we encode the numeric values.  So, it's better to make this clear at encode-time.
+		return buffer, fmt.Errorf("Unsupported numeric value %v", x)
 	}
 
 	var err error
 	v := reflect.ValueOf(in)
 	switch v.Kind() {
 	case reflect.Ptr:
-		return convert(v.Elem().Interface(), buffer)
+		return c.convert(v.Elem().Interface(), buffer)
 	case reflect.Array, reflect.Slice:
 		l := v.Len()
 		buffer = msgp.AppendArrayHeader(buffer, uint32(l))
 		for i := 0; i < l; i++ {
-			buffer, err = convert(v.Index(i).Interface(), buffer)
+			buffer, err = c.convert(v.Index(i).Interface(), buffer)
 			if err != nil {
 				return buffer, err
 			}
@@ -131,9 +212,10 @@ func convert(in interface{}, buffer []byte) ([]byte, error) {
 // This is primarily intended to assist conversion from JSON to MSGP, so certain
 // conversions such as structs are intentionally excluded. If you have a struct,
 // use `msgp.Marshal` directly.
-func Convert(in interface{}) ([]byte, error) {
+func Convert(in interface{}, typeHints map[string][]string) ([]byte, error) {
 	buffer := make([]byte, 0)
-	return convert(in, buffer)
+	c := Converter{typeHints: typeHints}
+	return c.convert(in, buffer)
 }
 
 // ConvertStream reads JSON from `in` and copies it as MSGP to `out` until EOF.
@@ -144,7 +226,15 @@ func Convert(in interface{}) ([]byte, error) {
 // - if the string is a valid ndau address, it's represented as a string.
 // - if the string is valid padded base64 in the standard encoding, it is decoded and represented in the MSGP as a byte array.
 // - otherwise, it is assumed to be a string, and represented as a string.
-func ConvertStream(in io.Reader, out io.Writer) error {
+//
+// Numeric valuse need extra help to know their types.  Use the typeHints map for that.
+//
+// - if all "Fee" variables are to be encoded as int64, and "ChangeOn" as uint64, then use:
+//   typeHints = {"Fee": []string{"int64"}, "ChangeOn": []string{"uint64"}}
+// - if there are blobs of json without names, yet there are arrays of differing numeric types,
+//   such as: [[0,1],[-2,3],[4,5]], then use:
+//   typeHints = {"": []string{"int64", "uint64"}}
+func ConvertStream(in io.Reader, out io.Writer, typeHints map[string][]string) error {
 	// JSON isn't length-prefixed, so we kind of have to parse the whole thing.
 	// It's a nice convenience function, at least, and we all have Effectively
 	// Infinite Memory, right?
@@ -160,7 +250,7 @@ func ConvertStream(in io.Reader, out io.Writer) error {
 		return errors.Wrap(err, "ConvertStream unmarshalling JSON")
 	}
 
-	msgp, err := Convert(jsobj)
+	msgp, err := Convert(jsobj, typeHints)
 	if err != nil {
 		return err
 	}
