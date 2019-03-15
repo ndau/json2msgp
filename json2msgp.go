@@ -107,6 +107,10 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 		buffer = msgp.AppendArrayHeader(buffer, uint32(len(x)))
 		var err error
 		// Because we reset this every time, this only works on the innermost of nested arrays.
+		// TODO: Generalize the type hint spec.  The way this is done now, with the % operator
+		// to grab currentHint below, is just a minimal solution to account for arrays with
+		// unnamed values.  We might consider generalized nested arrays, and also allowing a
+		// single-type hint without having to be inside an array within the hint json.
 		c.currentHint = 0
 		for _, v := range x {
 			buffer, err = c.convert(v, buffer)
@@ -122,14 +126,39 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 		if c.typeHints != nil {
 			if typeHint, ok := c.typeHints[c.currentKey]; ok {
 				currentHint := typeHint[c.currentHint % len(typeHint)]
+				// Support type hints for all msgp numeric formats.  We don't ensure that the
+				// value fits into the hinted type.  If there is a casting problem, the tool's
+				// user will have to supply a different type hint, or alter the input json.
 				switch currentHint {
+				case "byte":
+					return msgp.AppendByte(buffer, byte(x)), nil
+				case "float32":
+					return msgp.AppendFloat32(buffer, float32(x)), nil
+				case "float64":
+					return msgp.AppendFloat64(buffer, x), nil
+				case "int":
+					return msgp.AppendInt(buffer, int(x)), nil
+				case "int8":
+					return msgp.AppendInt8(buffer, int8(x)), nil
+				case "int16":
+					return msgp.AppendInt16(buffer, int16(x)), nil
+				case "int32":
+					return msgp.AppendInt32(buffer, int32(x)), nil
 				case "int64":
 					return msgp.AppendInt64(buffer, int64(x)), nil
+				case "uint":
+					return msgp.AppendUint(buffer, uint(x)), nil
+				case "uint8":
+					return msgp.AppendUint8(buffer, uint8(x)), nil
+				case "uint16":
+					return msgp.AppendUint16(buffer, uint16(x)), nil
+				case "uint32":
+					return msgp.AppendUint32(buffer, uint32(x)), nil
 				case "uint64":
 					return msgp.AppendUint64(buffer, uint64(x)), nil
 				default:
 					return buffer, fmt.Errorf(
-						"Unsupported type hint %s=%s", c.currentKey, currentHint)
+						"Unsupported numeric type hint %s=%s", c.currentKey, currentHint)
 				}
 			}
 		}
@@ -137,11 +166,13 @@ func (c *Converter) convert(in interface{}, buffer []byte) ([]byte, error) {
 		// Most of what we encode are of type int64, so we make that assumption here as part of
 		// this heuristic if we didn't find a type hint for it.
 		i := int64(x)
+		// Make sure the value is indeed an integer (has no fractional part).  This is meant as
+		// a convenience check for the tool's user.  We'll error below if this check fails.
 		if float64(i) == x {
 			return msgp.AppendInt64(buffer, i), nil
 		}
 
-		// We error here, rather than encoding in a different format.  Otherwise we could wind up
+		// We error here, rather than encoding to general float64.  Otherwise we could wind up
 		// encoding a blob of json containing multiple occurrences of a given variable (e.g. an
 		// array of objects), some of which get encoded one way, the rest another way.  In that
 		// case, when msgp unmarshals it later, it won't be able to handle the two different ways
