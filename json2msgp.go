@@ -19,7 +19,7 @@ import (
 	"sort"
 	"unicode/utf8"
 
-	"github.com/oneiro-ndev/ndaumath/pkg/address"
+	"github.com/ndau/ndaumath/pkg/address"
 	"github.com/pkg/errors"
 	"github.com/tinylib/msgp/msgp"
 )

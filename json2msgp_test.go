@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/oneiro-ndev/json2msgp"
+	"github.com/ndau/json2msgp"
 	"github.com/stretchr/testify/require"
 )
 
